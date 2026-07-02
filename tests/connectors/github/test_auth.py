@@ -1,6 +1,9 @@
 """Tests unitaires pour GitHubAuth."""
 import pytest
-from civitas_acquisition.connectors.code_repos.github.auth import GitHubAuth
+import time
+from civitas_acquisition.connectors.code_repos.github.auth import (
+    GitHubAuth, _installation_token_cache,
+)
 
 
 class TestGitHubAuthPAT:
@@ -46,12 +49,14 @@ class TestGitHubAuthApp:
         import time
         auth = GitHubAuth.from_app("123", "key", "456")
         auth._token = "some_token"
-        auth._token_expires_at = time.time() + 3600  # expire dans 1h
+        _installation_token_cache[auth._cache_key] = {"token": "some_token", "expires_at": time.time() + 3600}
         assert auth._needs_refresh() is False
 
     def test_needs_refresh_avec_token_expirant(self):
-        import time
-        auth = GitHubAuth.from_app("123", "key", "456")
+        auth = GitHubAuth.from_app("123", "key", "456-expiring")
         auth._token = "some_token"
-        auth._token_expires_at = time.time() + 30  # expire dans 30s (< 60s buffer)
+        _installation_token_cache[auth._cache_key] = {
+            "token": "some_token",
+            "expires_at": time.time() + 30,  # expire dans 30s < leeway 60s
+        }
         assert auth._needs_refresh() is True

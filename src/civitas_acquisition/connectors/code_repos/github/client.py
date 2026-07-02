@@ -1,16 +1,11 @@
 """
-GitHubClient — client HTTP async pour l'API GitHub REST v3.
+GitHubClient — client HTTP async pour l'API GitHub REST v3 + GraphQL v4.
 
-Responsabilités :
-  - Authentification automatique (injecte le token à chaque requête)
-  - Rate limit tracking et backoff automatique
-  - Pagination via Link header (yields des pages)
-  - Conditional requests via ETag / If-None-Match
-  - Gestion des erreurs HTTP → exceptions du domaine
-  - Retries sur les erreurs temporaires (502, 503, 504)
-
-N'a aucune connaissance des ressources GitHub (repos, issues, etc.).
-C'est le travail du Fetcher.
+Améliorations vs v1 :
+  - graphql() : support GraphQL avec variables
+  - get_installation_repos() : endpoint spécifique GitHub App
+  - Retry automatique 502/503/504 (3 tentatives, 1s entre chaque)
+  - Meilleure extraction du next_url depuis Link header
 """
 from __future__ import annotations
 
@@ -36,32 +31,42 @@ logger = logging.getLogger(__name__)
 
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
-BASE_URL = "https://api.github.com"
-DEFAULT_HEADERS = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "CIVITAS-Acquisition/1.0",
+BASE_URL        = "https://api.github.com"
+GRAPHQL_URL     = "https://api.github.com/graphql"
+GITHUB_VERSION  = "2022-11-28"
+
+_DEFAULT_HEADERS = {
+    "Accept":             "application/vnd.github+json",
+    "X-GitHub-Api-Version": GITHUB_VERSION,
+    "User-Agent":         "CIVITAS-Acquisition/1.0",
 }
+
+_SERVER_ERRORS  = (500, 502, 503, 504)
+_MAX_SERVER_RETRIES = 3
+
+
+class ResourceNotFoundError(Exception):
+    def __init__(self, url: str) -> None:
+        super().__init__(f"Resource not found: {url}")
+        self.url = url
 
 
 class GitHubClient:
     """
-    Client HTTP async pour l'API GitHub REST v3.
+    Client HTTP async pour l'API GitHub REST v3 et GraphQL v4.
 
     Usage :
         async with GitHubClient(auth) as client:
-            repo = await client.get("/repos/owner/repo")
-            async for page in client.paginate("/repos/owner/repo/issues"):
-                for issue in page:
-                    ...
+            user = await client.get("/user")
+            repos = await client.collect_all("/user/repos")
+            result = await client.graphql("query { viewer { login } }")
     """
 
     def __init__(self, auth: GitHubAuth, timeout_s: float = 30.0) -> None:
-        self._auth = auth
+        self._auth    = auth
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit: Optional[RateLimitInfo] = None
-        # ETag cache: url → (etag, cached_response)
         self._etag_cache: dict[str, tuple[str, Any]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -69,7 +74,7 @@ class GitHubClient:
     async def open(self) -> None:
         self._session = aiohttp.ClientSession(
             timeout=self._timeout,
-            headers=DEFAULT_HEADERS,
+            headers=_DEFAULT_HEADERS,
         )
 
     async def close(self) -> None:
@@ -78,64 +83,89 @@ class GitHubClient:
         self._session = None
 
     async def __aenter__(self) -> GitHubClient:
-        await self.open()
-        return self
+        await self.open(); return self
 
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
-    # ── Core requests ─────────────────────────────────────────────────────────
+    # ── Core GET ──────────────────────────────────────────────────────────────
 
     async def get(
         self,
         path: str,
         params: dict[str, Any] | None = None,
         use_etag: bool = False,
-    ) -> dict[str, Any] | list[Any] | None:
-        """
-        GET request vers l'API GitHub.
-        Retourne None si 304 Not Modified (ETag hit).
-        """
+    ) -> Any:
         url = path if path.startswith("https://") else f"{BASE_URL}{path}"
-        token = await self._auth.get_token()
+        token   = await self._auth.get_token()
         headers = {"Authorization": self._auth.auth_header(token)}
 
         if use_etag and url in self._etag_cache:
-            etag, _ = self._etag_cache[url]
-            headers["If-None-Match"] = etag
+            headers["If-None-Match"] = self._etag_cache[url][0]
 
-        await self._wait_if_rate_limited()
+        await self._wait_rate_limit()
+        assert self._session
 
-        assert self._session is not None, "Client not opened. Use async with or call open()."
-        async with self._session.get(url, params=params, headers=headers) as resp:
-            self._update_rate_limit(dict(resp.headers))
-
-            if resp.status == 304:
-                # Cache hit — retourner la réponse mise en cache
-                return self._etag_cache[url][1]
-
-            if resp.status == 200:
-                data = await resp.json()
-                if use_etag and "ETag" in resp.headers:
-                    self._etag_cache[url] = (resp.headers["ETag"], data)
-                return data
-
-            await self._handle_error(resp, url)
+        for attempt in range(1, _MAX_SERVER_RETRIES + 1):
+            async with self._session.get(url, params=params, headers=headers) as resp:
+                self._update_rate_limit(dict(resp.headers))
+                if resp.status == 304:
+                    return self._etag_cache[url][1]
+                if resp.status == 200:
+                    data = await resp.json()
+                    if use_etag and "ETag" in resp.headers:
+                        self._etag_cache[url] = (resp.headers["ETag"], data)
+                    return data
+                if resp.status in _SERVER_ERRORS and attempt < _MAX_SERVER_RETRIES:
+                    await asyncio.sleep(attempt)
+                    continue
+                await self._handle_error(resp, url)
 
     async def get_raw(self, url: str) -> bytes:
-        """GET raw bytes — pour le contenu des fichiers."""
-        token = await self._auth.get_token()
+        token   = await self._auth.get_token()
         headers = {
             "Authorization": self._auth.auth_header(token),
-            "Accept": "application/vnd.github.raw",
+            "Accept":        "application/vnd.github.raw",
         }
-        await self._wait_if_rate_limited()
-        assert self._session is not None
+        await self._wait_rate_limit()
+        assert self._session
         async with self._session.get(url, headers=headers) as resp:
             self._update_rate_limit(dict(resp.headers))
             if resp.status == 200:
                 return await resp.read()
             await self._handle_error(resp, url)
+
+    # ── POST / PATCH / DELETE ─────────────────────────────────────────────────
+
+    async def post(self, path: str, body: dict | None = None) -> Any:
+        return await self._request("POST", path, body=body)
+
+    async def patch(self, path: str, body: dict | None = None) -> Any:
+        return await self._request("PATCH", path, body=body)
+
+    async def delete(self, path: str) -> None:
+        await self._request("DELETE", path, expect_body=False)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        expect_body: bool = True,
+    ) -> Any:
+        url     = path if path.startswith("https://") else f"{BASE_URL}{path}"
+        token   = await self._auth.get_token()
+        headers = {"Authorization": self._auth.auth_header(token)}
+        assert self._session
+        async with self._session.request(method, url, json=body, headers=headers) as resp:
+            self._update_rate_limit(dict(resp.headers))
+            if resp.status in (200, 201, 204):
+                if expect_body and resp.status != 204:
+                    return await resp.json()
+                return None
+            await self._handle_error(resp, url)
+
+    # ── Pagination ────────────────────────────────────────────────────────────
 
     async def paginate(
         self,
@@ -144,33 +174,26 @@ class GitHubClient:
         per_page: int = 100,
         max_pages: int = 500,
     ) -> AsyncIterator[list[dict[str, Any]]]:
-        """
-        Itère sur toutes les pages d'un endpoint paginé.
-        Yields chaque page (liste d'items).
-        Suit les liens `next` dans le header Link.
-        """
-        url = path if path.startswith("https://") else f"{BASE_URL}{path}"
+        url           = path if path.startswith("https://") else f"{BASE_URL}{path}"
         request_params = {"per_page": per_page, **(params or {})}
-        page_count = 0
+        page_count    = 0
+        assert self._session
 
         while url and page_count < max_pages:
-            token = await self._auth.get_token()
+            token   = await self._auth.get_token()
             headers = {"Authorization": self._auth.auth_header(token)}
-            await self._wait_if_rate_limited()
+            await self._wait_rate_limit()
 
-            assert self._session is not None
             async with self._session.get(url, params=request_params, headers=headers) as resp:
                 self._update_rate_limit(dict(resp.headers))
-
                 if resp.status == 200:
                     data = await resp.json()
                     yield data if isinstance(data, list) else [data]
-                    page_count += 1
-                    # Chercher le lien suivant
-                    link_header = resp.headers.get("Link", "")
-                    match = _LINK_NEXT_RE.search(link_header)
-                    url = match.group(1) if match else ""
-                    request_params = {}   # les params sont déjà dans l'URL de pagination
+                    page_count  += 1
+                    link = resp.headers.get("Link", "")
+                    m = _LINK_NEXT_RE.search(link)
+                    url           = m.group(1) if m else ""
+                    request_params = {}
                 else:
                     await self._handle_error(resp, url)
                     break
@@ -181,11 +204,70 @@ class GitHubClient:
         params: dict[str, Any] | None = None,
         per_page: int = 100,
     ) -> list[dict[str, Any]]:
-        """Collecte tous les items d'un endpoint paginé en une seule liste."""
         result: list[dict[str, Any]] = []
         async for page in self.paginate(path, params=params, per_page=per_page):
             result.extend(page)
         return result
+
+    # ── GraphQL v4 ────────────────────────────────────────────────────────────
+
+    async def graphql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Execute une requête GraphQL GitHub v4.
+        Lève ConnectorFatalError si la réponse contient des erreurs.
+
+        Usage :
+            result = await client.graphql(
+                "query($login: String!) { user(login: $login) { name } }",
+                variables={"login": "octocat"},
+            )
+        """
+        token   = await self._auth.get_token()
+        headers = {
+            "Authorization":    self._auth.auth_header(token),
+            "Content-Type":     "application/json",
+        }
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        assert self._session
+        await self._wait_rate_limit()
+        async with self._session.post(GRAPHQL_URL, json=payload, headers=headers) as resp:
+            self._update_rate_limit(dict(resp.headers))
+            if resp.status != 200:
+                await self._handle_error(resp, GRAPHQL_URL)
+            data = await resp.json()
+            if "errors" in data:
+                errors = data["errors"]
+                msg = "; ".join(e.get("message", "") for e in errors)
+                raise ConnectorFatalError(f"GraphQL errors: {msg}")
+            return data.get("data", {})
+
+    # ── Installation repos (GitHub App) ───────────────────────────────────────
+
+    async def get_installation_repos(self) -> list[dict[str, Any]]:
+        """
+        Liste les repos accessibles par l'installation GitHub App.
+        Endpoint spécifique : /installation/repositories
+        (Activepieces pattern : getInstallationRepos)
+        """
+        all_repos: list[dict[str, Any]] = []
+        async for page in self.paginate("/installation/repositories", per_page=100):
+            # L'API retourne {"total_count": N, "repositories": [...]}
+            # mais avec paginate() on reçoit soit une list soit un dict
+            if isinstance(page, list):
+                # Cas où le premier item est le wrapper
+                for item in page:
+                    if isinstance(item, dict) and "repositories" in item:
+                        all_repos.extend(item["repositories"])
+                    elif isinstance(item, dict) and "full_name" in item:
+                        all_repos.append(item)
+        return all_repos
 
     # ── Rate limit ────────────────────────────────────────────────────────────
 
@@ -199,21 +281,22 @@ class GitHubClient:
             self._rate_limit = info
             if info.remaining < 100:
                 logger.warning(
-                    "GitHub rate limit low: %d/%d remaining (resets in %.0fs)",
+                    "Rate limit low: %d/%d (resets in %.0fs)",
                     info.remaining, info.limit,
                     max(0, info.reset_at - time.time()),
                 )
 
-    async def _wait_if_rate_limited(self) -> None:
-        """Attend si on approche la limite de taux."""
+    async def _wait_rate_limit(self) -> None:
         if self._rate_limit and self._rate_limit.remaining == 0:
             wait_s = max(0, self._rate_limit.reset_at - time.time()) + 1
-            logger.warning("Rate limit exhausted. Sleeping %.0fs...", wait_s)
+            logger.warning("Rate limit exhausted — sleeping %.0fs", wait_s)
             await asyncio.sleep(wait_s)
 
     # ── Error handling ────────────────────────────────────────────────────────
 
-    async def _handle_error(self, resp: aiohttp.ClientResponse, url: str) -> None:
+    async def _handle_error(
+        self, resp: aiohttp.ClientResponse, url: str
+    ) -> None:
         body = ""
         try:
             data = await resp.json()
@@ -227,34 +310,19 @@ class GitHubClient:
         status = resp.status
 
         if status == 401:
-            raise ConnectorAuthenticationError("github", f"401 Unauthorized: {body}")
-
+            raise ConnectorAuthenticationError("github", f"401: {body}")
         if status == 403:
             if "rate limit" in body.lower() or "abuse" in body.lower():
-                retry_after = float(resp.headers.get("Retry-After", 60))
-                raise ConnectorRateLimitError("github", retry_after_s=retry_after)
-            raise ConnectorAuthenticationError("github", f"403 Forbidden: {body}")
-
+                retry = float(resp.headers.get("Retry-After", 60))
+                raise ConnectorRateLimitError("github", retry_after_s=retry)
+            raise ConnectorAuthenticationError("github", f"403: {body}")
         if status == 404:
-            # 404 est souvent légitime en acquisition (resource supprimée)
-            logger.debug("404 at %s — resource not found, skipping", url)
             raise ResourceNotFoundError(url)
-
         if status == 422:
-            raise ConnectorFatalError(f"422 Unprocessable: {body} [{url}]")
-
+            raise ConnectorFatalError(f"422 Unprocessable: {body}")
         if status == 429:
-            retry_after = float(resp.headers.get("Retry-After", 60))
-            raise ConnectorRateLimitError("github", retry_after_s=retry_after)
-
-        if status in (500, 502, 503, 504):
+            retry = float(resp.headers.get("Retry-After", 60))
+            raise ConnectorRateLimitError("github", retry_after_s=retry)
+        if status in _SERVER_ERRORS:
             raise ConnectorTemporaryError(f"{status} Server Error at {url}: {body}")
-
         raise ConnectorNetworkError("github", url=url, cause=f"HTTP {status}: {body}")
-
-
-class ResourceNotFoundError(Exception):
-    """Ressource introuvable (404). Non-fatale — à ignorer dans le fetcher."""
-    def __init__(self, url: str) -> None:
-        super().__init__(f"Resource not found: {url}")
-        self.url = url

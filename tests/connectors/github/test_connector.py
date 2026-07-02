@@ -203,7 +203,7 @@ class TestHealthcheck:
 
         status = await connector.healthcheck()
         assert status.healthy is True
-        assert status.detail.get("rate_limit_remaining") == 4500
+        assert status.detail.get("rate_remaining") == 4500
 
     async def test_healthcheck_fail(self):
         connector = GitHubConnector()
