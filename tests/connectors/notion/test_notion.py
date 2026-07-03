@@ -1,6 +1,15 @@
 """Tests pour le connecteur Notion — sans appel réseau."""
 import pytest
 import json
+
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+
+pytestmark = pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+
 from civitas_acquisition.connectors.collaboration.notion.models import (
     NotionPage, NotionDatabase, NotionBlock,
 )
